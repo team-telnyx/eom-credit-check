@@ -3,8 +3,16 @@
 # Output: JSON array of results to stdout
 set -euo pipefail
 
+# --- Flags ---
+OUTPUT_FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) OUTPUT_FILE="$2"; shift 2 ;;
+    *) echo "Unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
 CONFIG_PATH="${CONFIG_PATH:-./config/config.json}"
-A2A_URL="http://revenue-agents.query.prod.telnyx.io:8000/a2a/billing-account/rpc"
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
   echo "ERROR: Config file not found at $CONFIG_PATH" >&2
@@ -17,6 +25,49 @@ if ! command -v jq &>/dev/null; then
   exit 1
 fi
 
+# --- Config validation ---
+if ! jq empty "$CONFIG_PATH" 2>/dev/null; then
+  echo "ERROR: $CONFIG_PATH is not valid JSON" >&2
+  exit 1
+fi
+
+missing_fields=()
+if [[ "$(jq 'has("customers") and (.customers | type == "array")' "$CONFIG_PATH")" != "true" ]]; then
+  missing_fields+=("customers (array)")
+fi
+if [[ "$(jq 'has("slack") and (.slack | has("alert_channel"))' "$CONFIG_PATH")" != "true" ]]; then
+  missing_fields+=("slack.alert_channel")
+fi
+if [[ "$(jq 'has("slack") and (.slack | has("escalation_channel"))' "$CONFIG_PATH")" != "true" ]]; then
+  missing_fields+=("slack.escalation_channel")
+fi
+if [[ ${#missing_fields[@]} -gt 0 ]]; then
+  echo "ERROR: Config missing required fields: ${missing_fields[*]}" >&2
+  exit 1
+fi
+
+# --- A2A URL: config → env → hardcoded default ---
+A2A_URL=$(jq -r '.a2a.billing_url // empty' "$CONFIG_PATH" 2>/dev/null || true)
+A2A_URL="${A2A_URL:-${A2A_ENDPOINT:-http://revenue-agents.query.prod.telnyx.io:8000/a2a/billing-account/rpc}}"
+
+# --- Retry wrapper (3 attempts, exponential backoff) ---
+retry_curl() {
+  local attempt=1 max=3 delay=2
+  while true; do
+    local output
+    output=$(curl --connect-timeout 10 --max-time 30 -s -X POST "$A2A_URL" \
+      -H "Content-Type: application/json" \
+      -d "$1" 2>/dev/null) && { echo "$output"; return 0; }
+    if [[ $attempt -ge $max ]]; then
+      echo '{"error":"request_failed"}'; return 1
+    fi
+    echo "  Retry $attempt/$max after ${delay}s..." >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+    attempt=$((attempt + 1))
+  done
+}
+
 BUFFER_DAYS=$(jq -r '.settings.buffer_days // 4' "$CONFIG_PATH")
 THRESHOLD=$(jq -r '.thresholds.alert_remaining // 0' "$CONFIG_PATH")
 INCREASE_PCT=$(jq -r '.settings.credit_increase_pct // 10' "$CONFIG_PATH")
@@ -25,6 +76,7 @@ ESCALATION_CHANNEL=$(jq -r '.slack.escalation_channel' "$CONFIG_PATH")
 CUSTOMER_COUNT=$(jq '.customers | length' "$CONFIG_PATH")
 
 results="[]"
+at_risk_count=0
 
 for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
   name=$(jq -r ".customers[$i].name" "$CONFIG_PATH")
@@ -37,23 +89,23 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
   msg_id="eom-check-$(date +%s)-$i"
   query="For org $org_id, provide the following as JSON: current_balance, current_month_usage, next_month_mrc, daily_run_rate, has_autorecharge_enabled (true/false), is_vip (true if priority is VIP/never auto-disabled, false otherwise). Use numeric values for amounts, booleans for flags."
 
-  response=$(curl -s -X POST "$A2A_URL" \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n \
-      --arg mid "$msg_id" \
-      --arg query "$query" \
-      '{
-        jsonrpc: "2.0",
-        id: $mid,
-        method: "message/send",
-        params: {
-          message: {
-            messageId: $mid,
-            role: "user",
-            parts: [{ kind: "text", text: $query }]
-          }
+  payload=$(jq -n \
+    --arg mid "$msg_id" \
+    --arg query "$query" \
+    '{
+      jsonrpc: "2.0",
+      id: $mid,
+      method: "message/send",
+      params: {
+        message: {
+          messageId: $mid,
+          role: "user",
+          parts: [{ kind: "text", text: $query }]
         }
-      }')" 2>/dev/null || echo '{"error":"request_failed"}')
+      }
+    }')
+
+  response=$(retry_curl "$payload")
 
   # Extract the text response from A2A result
   agent_text=$(echo "$response" | jq -r '
@@ -73,6 +125,7 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
         status: "error",
         error: "No response from billing agent"
       }]')
+    at_risk_count=$((at_risk_count + 1))
     continue
   fi
 
@@ -97,6 +150,7 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
         status: "parse_error",
         raw_response: $raw
       }]')
+    at_risk_count=$((at_risk_count + 1))
     continue
   fi
 
@@ -113,6 +167,7 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
   suggested_limit=""
   if [[ "$alert" == "true" ]]; then
     suggested_limit=$(echo "$credit_limit $INCREASE_PCT" | awk '{ printf "%.2f", $1 * (1 + $2/100) }')
+    at_risk_count=$((at_risk_count + 1))
   fi
 
   # Determine risk level
@@ -169,7 +224,7 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
 done
 
 # Build final output with metadata
-jq -n \
+final_output=$(jq -n \
   --argjson results "$results" \
   --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg alert_channel "$ALERT_CHANNEL" \
@@ -181,4 +236,14 @@ jq -n \
     escalation_channel: $escalation_channel,
     threshold: $threshold,
     results: $results
-  }'
+  }')
+
+echo "$final_output"
+
+# Save to file if --output was specified
+if [[ -n "$OUTPUT_FILE" ]]; then
+  echo "$final_output" > "$OUTPUT_FILE"
+  echo "📁 Results saved to $OUTPUT_FILE" >&2
+fi
+
+echo "✅ EOM Credit Check completed: $CUSTOMER_COUNT customers checked, $at_risk_count at risk" >&2
