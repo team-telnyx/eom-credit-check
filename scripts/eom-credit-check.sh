@@ -108,12 +108,29 @@ a2a_query() {
 
 # --- Extract a number from text near a keyword ---
 # Usage: extract_number "response text" "keyword1|keyword2"
+# Handles A2A prose like "Balance: -$46,891.29" or "**Balance:** -$46,891.29 USD"
+# Also handles "approximately 59%" or "$1,205/day" style responses
 extract_number() {
   local text="$1" pattern="$2"
-  # Look for the keyword followed by a dollar amount or number
-  # Handles: $1,234.56  -$1,234.56  1234.56  -1234.56  $80,000
-  echo "$text" | grep -ioE "${pattern}[^0-9\$-]{0,20}[-\$]{0,2}[0-9,]+\.?[0-9]*" | head -1 | \
-    grep -oE '[-]?\$?[0-9,]+\.?[0-9]*' | tail -1 | tr -d '$,' || echo ""
+  local result=""
+
+  # Strategy 1: Find line containing keyword, then extract the first dollar amount or number on that line
+  result=$(echo "$text" | grep -iE "$pattern" | head -1 | \
+    grep -oE '[-]?\$?[0-9][0-9,]*\.?[0-9]*' | head -1 | tr -d '$,' || echo "")
+
+  # Strategy 2: If strategy 1 failed, look for keyword followed by amount within 30 chars
+  if [[ -z "$result" ]]; then
+    result=$(echo "$text" | tr '\n' ' ' | \
+      grep -ioE "${pattern}[^0-9\$-]{0,30}[-\$]{0,2}[0-9][0-9,]*\.?[0-9]*" | head -1 | \
+      grep -oE '[-]?\$?[0-9][0-9,]*\.?[0-9]*' | head -1 | tr -d '$,' || echo "")
+  fi
+
+  # Strategy 3: For balance specifically, look for negative dollar amounts
+  if [[ -z "$result" && "$pattern" =~ balance ]]; then
+    result=$(echo "$text" | grep -oE '[-]\$[0-9][0-9,]*\.?[0-9]*' | head -1 | tr -d '$,' || echo "")
+  fi
+
+  echo "$result"
 }
 
 # --- Extract boolean from text near a keyword ---
@@ -212,9 +229,23 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
   fi
 
   # --- Parse Q2: usage, MRC, daily run rate ---
-  current_month_usage=$(extract_number "$q2_text" "usage|total.usage")
-  next_month_mrc=$(extract_number "$q2_text" "mrc|monthly.recurring|recurring.charge")
-  daily_run_rate=$(extract_number "$q2_text" "daily|run.rate")
+  # The agent returns detailed breakdowns. Try multiple patterns.
+  # For usage: look for "Usage Charges:" or "total usage" or "Net Total"
+  current_month_usage=$(extract_number "$q2_text" "usage.charges|total.usage|net.total")
+  # If we got a negative net total (credits applied), try just usage charges
+  if [[ -z "$current_month_usage" || "$current_month_usage" == "0" ]]; then
+    current_month_usage=$(extract_number "$q2_text" "usage")
+  fi
+
+  # For MRC: look for "Monthly Recurring" or "MRC:" 
+  next_month_mrc=$(extract_number "$q2_text" "monthly.recurring|MRC|recurring.charge")
+  
+  # For daily run rate: look for "Daily Usage" or "daily run rate" or "$X/day" or "Average Daily"
+  daily_run_rate=$(extract_number "$q2_text" "daily.usage|daily.run|average.daily")
+  # Fallback: look for pattern like $1,205/day
+  if [[ -z "$daily_run_rate" ]]; then
+    daily_run_rate=$(echo "$q2_text" | grep -oE '\$[0-9,]+\.?[0-9]*/day' | head -1 | tr -d '$/day,' || echo "")
+  fi
 
   # --- Parse Q3: auto-recharge, VIP ---
   has_autorecharge=$(extract_bool "$q3_text" "auto.?recharge")

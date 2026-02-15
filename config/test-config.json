@@ -1,0 +1,13 @@
+{
+  "customers": [
+    {"name": "AudioCodes", "org_id": "6d3e3c5d-2a8c-4b05-9af7-f3aae39a047f", "credit_limit": 80000, "currency": "USD"},
+    {"name": "Call Box", "org_id": "0c006f01-c646-4229-b0e9-512e491e4930", "credit_limit": 250000, "currency": "USD"}
+  ],
+  "slack": {
+    "alert_channel": "D0ABP63LVRP",
+    "escalation_channel": "C048F26MJQ3"
+  },
+  "thresholds": {"alert_remaining": 0},
+  "settings": {"credit_increase_pct": 10, "buffer_days": 4},
+  "a2a": {"billing_url": "http://revenue-agents.query.prod.telnyx.io:8000/a2a/billing-account/rpc"}
+}
