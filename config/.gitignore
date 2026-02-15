@@ -1,0 +1,3 @@
+# Ignore actual config (contains customer data)
+config.json
+*.local.json
