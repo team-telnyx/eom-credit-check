@@ -5,9 +5,11 @@ set -euo pipefail
 
 # --- Flags ---
 OUTPUT_FILE=""
+DRY_RUN=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output) OUTPUT_FILE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -68,6 +70,71 @@ retry_curl() {
   done
 }
 
+# --- Send a single A2A query and return the text response ---
+a2a_query() {
+  local msg_id="$1" query="$2"
+  local payload
+  payload=$(jq -n \
+    --arg mid "$msg_id" \
+    --arg query "$query" \
+    '{
+      jsonrpc: "2.0",
+      id: $mid,
+      method: "message/send",
+      params: {
+        message: {
+          messageId: $mid,
+          role: "user",
+          parts: [{ kind: "text", text: $query }]
+        }
+      }
+    }')
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[DRY RUN] Would query: $query" >&2
+    echo ""
+    return 0
+  fi
+
+  local response
+  response=$(retry_curl "$payload")
+
+  echo "$response" | jq -r '
+    .result.artifacts[0].parts[0].text //
+    .result.message.parts[0].text //
+    .result.parts[0].text //
+    empty' 2>/dev/null || echo ""
+}
+
+# --- Extract a number from text near a keyword ---
+# Usage: extract_number "response text" "keyword1|keyword2"
+extract_number() {
+  local text="$1" pattern="$2"
+  # Look for the keyword followed by a dollar amount or number
+  # Handles: $1,234.56  -$1,234.56  1234.56  -1234.56  $80,000
+  echo "$text" | grep -ioE "${pattern}[^0-9\$-]{0,20}[-\$]{0,2}[0-9,]+\.?[0-9]*" | head -1 | \
+    grep -oE '[-]?\$?[0-9,]+\.?[0-9]*' | tail -1 | tr -d '$,' || echo ""
+}
+
+# --- Extract boolean from text near a keyword ---
+extract_bool() {
+  local text="$1" pattern="$2"
+  local snippet
+  snippet=$(echo "$text" | grep -ioE "${pattern}[^.]{0,40}" | head -1 || echo "")
+  if echo "$snippet" | grep -iqE '(yes|true|enabled|active|is vip|is a vip|has auto|with auto)'; then
+    echo "true"
+  elif echo "$snippet" | grep -iqE '(no|false|disabled|inactive|not vip|not a vip|no auto|without auto)'; then
+    echo "false"
+  else
+    # Fallback: check the whole text for the pattern
+    if echo "$text" | grep -iqE "(${pattern}).{0,20}(yes|true|enabled|active)"; then
+      echo "true"
+    else
+      echo "false"
+    fi
+  fi
+}
+
 BUFFER_DAYS=$(jq -r '.settings.buffer_days // 4' "$CONFIG_PATH")
 THRESHOLD=$(jq -r '.thresholds.alert_remaining // 0' "$CONFIG_PATH")
 INCREASE_PCT=$(jq -r '.settings.credit_increase_pct // 10' "$CONFIG_PATH")
@@ -86,35 +153,25 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
 
   echo "Checking $name ($org_id)..." >&2
 
-  msg_id="eom-check-$(date +%s)-$i"
-  query="For org $org_id, provide the following as JSON: current_balance, current_month_usage, next_month_mrc, daily_run_rate, has_autorecharge_enabled (true/false), is_vip (true if priority is VIP/never auto-disabled, false otherwise). Use numeric values for amounts, booleans for flags."
+  ts=$(date +%s)
 
-  payload=$(jq -n \
-    --arg mid "$msg_id" \
-    --arg query "$query" \
-    '{
-      jsonrpc: "2.0",
-      id: $mid,
-      method: "message/send",
-      params: {
-        message: {
-          messageId: $mid,
-          role: "user",
-          parts: [{ kind: "text", text: $query }]
-        }
-      }
-    }')
+  # --- Query 1: Balance, credit limit, available credit ---
+  echo "  Query 1/3: balance & credit..." >&2
+  q1_text=$(a2a_query "eom-${ts}-${i}-q1" \
+    "What is the current balance, credit limit, and available credit for org ${org_id}?")
 
-  response=$(retry_curl "$payload")
+  # --- Query 2: Usage, MRC, daily run rate ---
+  echo "  Query 2/3: usage & MRC..." >&2
+  q2_text=$(a2a_query "eom-${ts}-${i}-q2" \
+    "What is the current month's total usage, MRC (monthly recurring charges), and daily usage run rate for org ${org_id}?")
 
-  # Extract the text response from A2A result
-  agent_text=$(echo "$response" | jq -r '
-    .result.artifacts[0].parts[0].text //
-    .result.message.parts[0].text //
-    .result.parts[0].text //
-    empty' 2>/dev/null || echo "")
+  # --- Query 3: Auto-recharge, VIP status ---
+  echo "  Query 3/3: auto-recharge & VIP..." >&2
+  q3_text=$(a2a_query "eom-${ts}-${i}-q3" \
+    "Does org ${org_id} have auto-recharge enabled? What is their VIP/priority status?")
 
-  if [[ -z "$agent_text" ]]; then
+  # Check if we got at least Q1 back
+  if [[ -z "$q1_text" && "$DRY_RUN" != "true" ]]; then
     echo "  WARNING: No response from billing agent for $name" >&2
     results=$(echo "$results" | jq \
       --arg name "$name" \
@@ -129,30 +186,66 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
     continue
   fi
 
-  # Parse numeric fields from agent response (expects JSON in the text)
-  current_balance=$(echo "$agent_text" | jq -r '.current_balance // empty' 2>/dev/null || echo "")
-  current_month_usage=$(echo "$agent_text" | jq -r '.current_month_usage // empty' 2>/dev/null || echo "")
-  next_month_mrc=$(echo "$agent_text" | jq -r '.next_month_mrc // empty' 2>/dev/null || echo "")
-  daily_run_rate=$(echo "$agent_text" | jq -r '.daily_run_rate // empty' 2>/dev/null || echo "")
-  has_autorecharge=$(echo "$agent_text" | jq -r '.has_autorecharge_enabled // false' 2>/dev/null || echo "false")
-  is_vip=$(echo "$agent_text" | jq -r '.is_vip // false' 2>/dev/null || echo "false")
-
-  # If agent didn't return clean JSON, try extracting numbers from text
-  if [[ -z "$current_balance" ]]; then
-    echo "  WARNING: Could not parse structured data for $name. Raw response logged." >&2
+  if [[ "$DRY_RUN" == "true" ]]; then
     results=$(echo "$results" | jq \
       --arg name "$name" \
       --arg org "$org_id" \
-      --arg raw "$agent_text" \
+      '. + [{
+        customer: $name,
+        org_id: $org,
+        status: "dry_run"
+      }]')
+    continue
+  fi
+
+  # --- Parse Q1: balance, credit limit (from agent), available credit ---
+  current_balance=$(extract_number "$q1_text" "balance")
+  agent_credit_limit=$(extract_number "$q1_text" "credit.limit")
+  available_credit=$(extract_number "$q1_text" "available")
+
+  # Use config credit_limit as authoritative, but log if agent disagrees
+  if [[ -n "$agent_credit_limit" ]]; then
+    diff_check=$(awk "BEGIN { d = $credit_limit - $agent_credit_limit; print (d < 0 ? -d : d) }")
+    if awk "BEGIN { exit ($diff_check > 1) ? 0 : 1 }" 2>/dev/null; then
+      echo "  NOTE: Agent reports credit limit $agent_credit_limit vs config $credit_limit" >&2
+    fi
+  fi
+
+  # --- Parse Q2: usage, MRC, daily run rate ---
+  current_month_usage=$(extract_number "$q2_text" "usage|total.usage")
+  next_month_mrc=$(extract_number "$q2_text" "mrc|monthly.recurring|recurring.charge")
+  daily_run_rate=$(extract_number "$q2_text" "daily|run.rate")
+
+  # --- Parse Q3: auto-recharge, VIP ---
+  has_autorecharge=$(extract_bool "$q3_text" "auto.?recharge")
+  is_vip=$(extract_bool "$q3_text" "vip|priority")
+
+  # --- Validate we got the critical numbers ---
+  if [[ -z "$current_balance" || -z "$current_month_usage" || -z "$daily_run_rate" ]]; then
+    echo "  WARNING: Could not parse all fields for $name" >&2
+    echo "    Q1: $q1_text" >&2
+    echo "    Q2: $q2_text" >&2
+    echo "    Q3: $q3_text" >&2
+    results=$(echo "$results" | jq \
+      --arg name "$name" \
+      --arg org "$org_id" \
+      --arg q1 "$q1_text" \
+      --arg q2 "$q2_text" \
+      --arg q3 "$q3_text" \
       '. + [{
         customer: $name,
         org_id: $org,
         status: "parse_error",
-        raw_response: $raw
+        raw_q1: $q1,
+        raw_q2: $q2,
+        raw_q3: $q3
       }]')
     at_risk_count=$((at_risk_count + 1))
     continue
   fi
+
+  # Default MRC to 0 if not found (some accounts may not have it)
+  next_month_mrc="${next_month_mrc:-0}"
 
   # Formula: Remaining = Credit Limit - |Current Balance| - Current Month Usage - Next Month MRC - (buffer_days × daily run rate)
   remaining=$(echo "$credit_limit $current_balance $current_month_usage $next_month_mrc $daily_run_rate $BUFFER_DAYS" | \
