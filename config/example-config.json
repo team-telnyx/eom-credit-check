@@ -23,6 +23,9 @@
     "alert_channel": "C000000ALERT",
     "escalation_channel": "C000000ESCAL"
   },
+  "a2a": {
+    "billing_url": "http://revenue-agents.query.prod.telnyx.io:8000/a2a/billing-account/rpc"
+  },
   "thresholds": {
     "alert_remaining": 0
   },

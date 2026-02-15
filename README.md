@@ -47,6 +47,7 @@ cp .env.example .env
 # Edit .env with your actual values:
 #   SLACK_BOT_TOKEN=xoxb-your-token
 #   CONFIG_PATH=./config/config.json  (optional, this is the default)
+#   A2A_ENDPOINT=...  (optional, overrides config a2a.billing_url)
 ```
 
 ### 3. Run Manually
@@ -55,13 +56,21 @@ cp .env.example .env
 # Check credit — outputs JSON results
 bash scripts/eom-credit-check.sh
 
+# Save results to file for audit trail
+bash scripts/eom-credit-check.sh --output results.json
+
 # Post alerts to Slack
 bash scripts/eom-credit-check.sh | bash scripts/post-alerts.sh
+
+# Dry-run: preview what would be posted without sending to Slack
+bash scripts/eom-credit-check.sh | bash scripts/post-alerts.sh --dry-run
+# Or via env var:
+DRY_RUN=true bash scripts/eom-credit-check.sh | bash scripts/post-alerts.sh
 ```
 
 ### 4. Set Up as OpenClaw Cron Job
 
-Add a cron job in OpenClaw to run on the 27th of each month. See `memory/agents/eom-credit-check.md` for agent instructions.
+Add a cron job in OpenClaw to run on the 27th of each month. See `docs/agent-instructions.md` for agent instructions.
 
 ## Config File Format
 
@@ -72,9 +81,21 @@ See `config/example-config.json` for the full template. Key sections:
 | `customers` | Array of `{name, org_id, credit_limit, currency}` |
 | `slack.alert_channel` | Channel ID for alerts |
 | `slack.escalation_channel` | Channel ID for critical escalations |
+| `a2a.billing_url` | A2A billing agent URL (optional, has default) |
 | `thresholds.alert_remaining` | Dollar amount below which to alert (default: `0`) |
 | `settings.credit_increase_pct` | Suggested increase % (default: `10`) |
 | `settings.buffer_days` | Days of run-rate buffer (default: `4`) |
+
+## Features
+
+- **Retry logic**: A2A billing queries retry up to 3 times with exponential backoff
+- **Timeouts**: All HTTP requests have connect (10s) and max-time (30s) limits
+- **Configurable A2A URL**: Set via config (`a2a.billing_url`), env var (`A2A_ENDPOINT`), or use built-in default
+- **Config validation**: Validates JSON structure and required fields at startup
+- **Dry-run mode**: Preview Slack alerts without posting (`--dry-run` flag or `DRY_RUN=true`)
+- **Output to file**: Save results JSON with `--output <file>` for audit trail
+- **Batched Slack alerts**: One summary message with threaded details per HIGH risk customer
+- **Monitoring-friendly**: Outputs a completion summary line to stderr
 
 ## Requirements
 
