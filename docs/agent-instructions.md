@@ -14,7 +14,8 @@ cd ~/clawd/skills/eom-credit-check && source .env && bash scripts/eom-credit-che
 ## What It Does
 1. Reads customer list from `config/config.json`
 2. Queries the billing A2A agent for each customer's balance, usage, MRC, and daily run rate
-3. Calculates: `Remaining = Credit Limit - |Balance| - Usage - MRC - (4 × daily rate)`
+3. Calculates: `Remaining = Credit Limit - |Balance| - MRC - (4 × daily rate)`
+   ⚠️ **Do NOT subtract usage separately** — Telnyx is pay-as-you-go; usage is already in the balance in real-time.
 4. Posts alerts to Slack for any customer with Remaining < $0
 5. Escalates critical cases (severe shortfall) to the escalation channel
 
