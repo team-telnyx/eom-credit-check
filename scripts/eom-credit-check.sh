@@ -278,11 +278,14 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
   # Default MRC to 0 if not found (some accounts may not have it)
   next_month_mrc="${next_month_mrc:-0}"
 
-  # Formula: Remaining = Credit Limit - |Current Balance| - Current Month Usage - Next Month MRC - (buffer_days × daily run rate)
-  remaining=$(echo "$credit_limit $current_balance $current_month_usage $next_month_mrc $daily_run_rate $BUFFER_DAYS" | \
+  # Formula: Remaining = Credit Limit - |Current Balance| - MRC - (buffer_days × daily run rate)
+  # NOTE: Telnyx is pay-as-you-go — usage hits the balance in real-time and is already in |Balance|.
+  # DO NOT subtract current_month_usage separately; doing so double-counts it and creates false alerts.
+  # current_month_usage is still fetched above to calculate the daily_run_rate.
+  remaining=$(echo "$credit_limit $current_balance $next_month_mrc $daily_run_rate $BUFFER_DAYS" | \
     awk '{
       abs_balance = ($2 < 0) ? -$2 : $2
-      remaining = $1 - abs_balance - $3 - $4 - ($6 * $5)
+      remaining = $1 - abs_balance - $3 - ($5 * $4)
       printf "%.2f", remaining
     }')
 
